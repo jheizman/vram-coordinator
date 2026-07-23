@@ -1,0 +1,9 @@
+services:
+  vram-coordinator:
+    image: ghcr.io/jheizman/vram-coordinator:dev
+    container_name: vram-coordinator
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
