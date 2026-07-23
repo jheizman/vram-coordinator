@@ -1,7 +1,7 @@
-from pydantic import BaseModel, Field
 from enum import IntEnum
-from typing import Optional
-import uuid
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
 
 
 class PriorityTier(IntEnum):
@@ -11,27 +11,35 @@ class PriorityTier(IntEnum):
 
 
 class AcquireRequest(BaseModel):
-    caller_id: str
+    caller_id: str = Field(min_length=1)
     vram_mb: int = Field(gt=0)
     tier: PriorityTier = PriorityTier.normal
-    deadline_seconds: Optional[float] = 30.0
+    deadline_seconds: Optional[float] = Field(default=None, gt=0)
 
 
 class AcquireResponse(BaseModel):
     lease_id: Optional[str]
-    result: str  # permit | deny | shed
+    result: Literal["permit", "deny", "shed"]
     vram_mb: int
     message: str
+    request_id: str
 
 
 class ReleaseRequest(BaseModel):
-    lease_id: str
-    caller_id: str
+    lease_id: str = Field(min_length=1)
+    caller_id: str = Field(min_length=1)
 
 
 class ReleaseResponse(BaseModel):
     released: bool
     message: str
+    request_id: str
+
+
+class DecisionCounters(BaseModel):
+    permit: int
+    deny: int
+    shed: int
 
 
 class StatsResponse(BaseModel):
@@ -43,4 +51,11 @@ class StatsResponse(BaseModel):
     hard_floor_mb: int
     active_leases: int
     queue_depth: int
-    decisions: dict
+    queue_depth_by_tier: dict[str, int]
+    decisions: DecisionCounters
+
+
+class ErrorResponse(BaseModel):
+    code: str
+    message: str
+    request_id: str

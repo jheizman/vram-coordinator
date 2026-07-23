@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from .config import Settings, CoordinatorMode
+from .config import CoordinatorMode, Settings
 from .gpu import query_vram
 from .models import AcquireRequest, AcquireResponse, ReleaseRequest, ReleaseResponse
 
@@ -22,34 +22,58 @@ class Lease:
     created_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class PendingAcquire:
+    request_id: str
+    caller_id: str
+    vram_mb: int
+    tier: int
+    enqueue_seq: int
+    deadline_at: float
+    future: asyncio.Future
+
+
 class Coordinator:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._leases: Dict[str, Lease] = {}
+        self._pending: Dict[str, PendingAcquire] = {}
         self._decisions = {"permit": 0, "deny": 0, "shed": 0}
-        self._queue_depth = 0
         self._ttl_task: Optional[asyncio.Task] = None
+        self._queue_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+        self._seq = 0
 
     async def start(self):
         self._ttl_task = asyncio.create_task(self._ttl_loop())
-        log.info(json.dumps({"event": "startup", "mode": str(self.settings.coordinator_mode)}))
+        self._queue_task = asyncio.create_task(self._queue_loop())
+        log.info(json.dumps({"event": "startup", "mode": self.settings.coordinator_mode.value}))
 
     async def stop(self):
-        if self._ttl_task:
-            self._ttl_task.cancel()
-            try:
-                await self._ttl_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._ttl_task, self._queue_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         log.info(json.dumps({"event": "shutdown"}))
 
     async def _ttl_loop(self):
         while True:
-            await asyncio.sleep(30)
-            self._expire_leases()
+            await asyncio.sleep(5)
+            async with self._lock:
+                self._expire_leases_locked(time.monotonic())
 
-    def _expire_leases(self):
-        now = time.monotonic()
+    async def _queue_loop(self):
+        while True:
+            await asyncio.sleep(0.5)
+            async with self._lock:
+                now = time.monotonic()
+                self._expire_pending_locked(now)
+                self._drain_queue_locked(now)
+
+    def _expire_leases_locked(self, now: float) -> None:
         expired = [
             lid for lid, lease in self._leases.items()
             if now - lease.created_at > self.settings.lease_ttl_seconds
@@ -58,120 +82,266 @@ class Coordinator:
             lease = self._leases.pop(lid)
             log.warning(json.dumps({
                 "event": "lease_expired",
-                "caller_id": lease.caller_id,
                 "lease_id": lid,
+                "caller_id": lease.caller_id,
                 "vram_mb": lease.vram_mb,
             }))
 
-    def _vram_available(self) -> Optional[int]:
+    def _expire_pending_locked(self, now: float) -> None:
+        expired_ids = [
+            req_id for req_id, pending in self._pending.items()
+            if pending.deadline_at <= now
+        ]
+        for req_id in expired_ids:
+            pending = self._pending.pop(req_id)
+            if not pending.future.done():
+                pending.future.set_result(("shed", None, "deadline exceeded"))
+                self._decisions["shed"] += 1
+                log.warning(json.dumps({
+                    "event": "acquire_timeout",
+                    "request_id": pending.request_id,
+                    "caller_id": pending.caller_id,
+                    "vram_mb": pending.vram_mb,
+                    "tier": pending.tier,
+                    "result": "shed",
+                }))
+
+    def _queue_depth_by_tier_locked(self) -> dict[str, int]:
+        counts = {"high": 0, "normal": 0, "low": 0}
+        for pending in self._pending.values():
+            if pending.tier == 1:
+                counts["high"] += 1
+            elif pending.tier == 2:
+                counts["normal"] += 1
+            else:
+                counts["low"] += 1
+        return counts
+
+    def _queue_depth_locked(self) -> int:
+        return len(self._pending)
+
+    def _committed_mb_locked(self) -> int:
+        return sum(lease.vram_mb for lease in self._leases.values())
+
+    def _gpu_snapshot(self) -> tuple[int, int, int]:
         info = query_vram()
         if info is None:
-            return None
-        return info["total_mb"] - info["used_mb"] - self.settings.safety_overhead_mb
+            return 0, 0, 0
+        total = int(info["total_mb"])
+        used = int(info["used_mb"])
+        available = total - used - self.settings.safety_overhead_mb
+        return total, used, max(available, 0)
 
-    def _committed_mb(self) -> int:
-        return sum(l.vram_mb for l in self._leases.values())
-
-    def acquire(self, req: AcquireRequest) -> AcquireResponse:
-        available = self._vram_available()
-        mode = self.settings.coordinator_mode
-
-        if mode == CoordinatorMode.observe:
-            lease_id = str(uuid.uuid4())
-            self._leases[lease_id] = Lease(
-                lease_id=lease_id, caller_id=req.caller_id,
-                vram_mb=req.vram_mb, tier=int(req.tier),
-            )
-            self._decisions["permit"] += 1
-            log.info(json.dumps({
-                "event": "acquire", "caller_id": req.caller_id,
-                "vram_mb": req.vram_mb, "tier": int(req.tier),
-                "result": "permit", "mode": "observe",
-                "vram_available_mb": available, "lease_id": lease_id,
-            }))
-            return AcquireResponse(
-                lease_id=lease_id, result="permit",
-                vram_mb=req.vram_mb,
-                message=f"observe mode — would permit (available={available} MB)",
-            )
-
-        # enforce mode
-        if available is None:
-            log.error(json.dumps({"event": "acquire", "error": "gpu_query_failed",
-                                  "caller_id": req.caller_id, "result": "permit"}))
-            lease_id = str(uuid.uuid4())
-            self._leases[lease_id] = Lease(
-                lease_id=lease_id, caller_id=req.caller_id,
-                vram_mb=req.vram_mb, tier=int(req.tier),
-            )
-            self._decisions["permit"] += 1
-            return AcquireResponse(
-                lease_id=lease_id, result="permit", vram_mb=req.vram_mb,
-                message="gpu_query_failed: permit (fail-safe)",
-            )
-
-        projected = available - req.vram_mb
+    def _can_grant_locked(self, vram_mb: int, tier: int, available: int) -> tuple[bool, str]:
+        projected = available - vram_mb
         if projected < self.settings.hard_floor_mb:
-            self._decisions["deny"] += 1
-            log.info(json.dumps({
-                "event": "acquire", "caller_id": req.caller_id,
-                "vram_mb": req.vram_mb, "tier": int(req.tier),
-                "result": "deny", "mode": "enforce",
-                "vram_available_mb": available, "projected_mb": projected,
-                "hard_floor_mb": self.settings.hard_floor_mb,
-            }))
-            return AcquireResponse(
-                lease_id=None, result="deny", vram_mb=0,
-                message=(f"hard floor breached: {available} MB available, "
-                         f"need {req.vram_mb} MB, floor {self.settings.hard_floor_mb} MB"),
-            )
+            return False, "hard_floor"
+        if tier >= 3 and projected < self.settings.soft_floor_mb:
+            return False, "soft_floor_low_tier"
+        return True, "ok"
 
+    def _grant_locked(self, pending: PendingAcquire, mode: str, available: int) -> None:
         lease_id = str(uuid.uuid4())
         self._leases[lease_id] = Lease(
-            lease_id=lease_id, caller_id=req.caller_id,
-            vram_mb=req.vram_mb, tier=int(req.tier),
+            lease_id=lease_id,
+            caller_id=pending.caller_id,
+            vram_mb=pending.vram_mb,
+            tier=pending.tier,
         )
         self._decisions["permit"] += 1
-
-        soft_pressure = projected < self.settings.soft_floor_mb
+        if not pending.future.done():
+            pending.future.set_result(("permit", lease_id, f"granted ({mode})"))
         log.info(json.dumps({
-            "event": "acquire", "caller_id": req.caller_id,
-            "vram_mb": req.vram_mb, "tier": int(req.tier),
-            "result": "permit", "mode": "enforce",
-            "vram_available_mb": available, "projected_mb": projected,
-            "soft_pressure": soft_pressure, "lease_id": lease_id,
+            "event": "acquire",
+            "request_id": pending.request_id,
+            "caller_id": pending.caller_id,
+            "vram_mb": pending.vram_mb,
+            "tier": pending.tier,
+            "result": "permit",
+            "mode": mode,
+            "vram_available_mb": available,
+            "lease_id": lease_id,
         }))
+
+    def _drain_queue_locked(self, now: float) -> None:
+        if not self._pending:
+            return
+        _total, _used, available = self._gpu_snapshot()
+        ordered = sorted(
+            self._pending.values(),
+            key=lambda item: (item.tier, item.enqueue_seq),
+        )
+        for pending in ordered:
+            if pending.request_id not in self._pending:
+                continue
+            can_grant, reason = self._can_grant_locked(pending.vram_mb, pending.tier, available)
+            if can_grant:
+                self._pending.pop(pending.request_id, None)
+                self._grant_locked(pending, "enforce", available)
+                available -= pending.vram_mb
+                continue
+
+            if reason == "soft_floor_low_tier":
+                self._pending.pop(pending.request_id, None)
+                self._decisions["shed"] += 1
+                if not pending.future.done():
+                    pending.future.set_result(("shed", None, "soft pressure low-tier shedding"))
+                log.warning(json.dumps({
+                    "event": "acquire",
+                    "request_id": pending.request_id,
+                    "caller_id": pending.caller_id,
+                    "vram_mb": pending.vram_mb,
+                    "tier": pending.tier,
+                    "result": "shed",
+                    "reason": "soft_floor_low_tier",
+                }))
+
+    async def acquire(self, req: AcquireRequest, request_id: str) -> AcquireResponse:
+        deadline_seconds = req.deadline_seconds or self.settings.default_deadline_seconds
+        now = time.monotonic()
+
+        async with self._lock:
+            self._expire_leases_locked(now)
+            _total, _used, available = self._gpu_snapshot()
+
+            if self.settings.coordinator_mode == CoordinatorMode.observe:
+                pending = PendingAcquire(
+                    request_id=request_id,
+                    caller_id=req.caller_id,
+                    vram_mb=req.vram_mb,
+                    tier=int(req.tier),
+                    enqueue_seq=self._seq,
+                    deadline_at=now + deadline_seconds,
+                    future=asyncio.get_running_loop().create_future(),
+                )
+                self._seq += 1
+                self._grant_locked(pending, "observe", available)
+                result, lease_id, message = pending.future.result()
+                return AcquireResponse(
+                    lease_id=lease_id,
+                    result=result,
+                    vram_mb=req.vram_mb if lease_id else 0,
+                    message=message,
+                    request_id=request_id,
+                )
+
+            if available <= 0:
+                self._decisions["deny"] += 1
+                return AcquireResponse(
+                    lease_id=None,
+                    result="deny",
+                    vram_mb=0,
+                    message="no VRAM headroom available",
+                    request_id=request_id,
+                )
+
+            if self._queue_depth_locked() >= self.settings.max_queue_depth:
+                self._decisions["shed"] += 1
+                return AcquireResponse(
+                    lease_id=None,
+                    result="shed",
+                    vram_mb=0,
+                    message="queue is full",
+                    request_id=request_id,
+                )
+
+            loop = asyncio.get_running_loop()
+            pending = PendingAcquire(
+                request_id=request_id,
+                caller_id=req.caller_id,
+                vram_mb=req.vram_mb,
+                tier=int(req.tier),
+                enqueue_seq=self._seq,
+                deadline_at=now + deadline_seconds,
+                future=loop.create_future(),
+            )
+            self._seq += 1
+            self._pending[pending.request_id] = pending
+
+            self._drain_queue_locked(now)
+
+        timeout = max(deadline_seconds, 0.1)
+        try:
+            result, lease_id, message = await asyncio.wait_for(pending.future, timeout=timeout)
+        except asyncio.TimeoutError:
+            async with self._lock:
+                existed = self._pending.pop(request_id, None)
+                if existed is not None:
+                    self._decisions["shed"] += 1
+            return AcquireResponse(
+                lease_id=None,
+                result="shed",
+                vram_mb=0,
+                message="deadline exceeded",
+                request_id=request_id,
+            )
+
+        if result == "permit":
+            return AcquireResponse(
+                lease_id=lease_id,
+                result="permit",
+                vram_mb=req.vram_mb,
+                message=message,
+                request_id=request_id,
+            )
+        if result == "deny":
+            return AcquireResponse(
+                lease_id=None,
+                result="deny",
+                vram_mb=0,
+                message=message,
+                request_id=request_id,
+            )
         return AcquireResponse(
-            lease_id=lease_id, result="permit", vram_mb=req.vram_mb,
-            message="granted" + (" (soft pressure)" if soft_pressure else ""),
+            lease_id=None,
+            result="shed",
+            vram_mb=0,
+            message=message,
+            request_id=request_id,
         )
 
-    def release(self, req: ReleaseRequest) -> ReleaseResponse:
-        lease = self._leases.pop(req.lease_id, None)
-        if lease is None:
-            log.warning(json.dumps({
-                "event": "release", "result": "not_found",
-                "lease_id": req.lease_id, "caller_id": req.caller_id,
-            }))
-            return ReleaseResponse(released=False, message="lease not found")
-        log.info(json.dumps({
-            "event": "release", "result": "ok",
-            "lease_id": req.lease_id, "caller_id": req.caller_id,
-            "vram_mb": lease.vram_mb,
-        }))
-        return ReleaseResponse(released=True, message="ok")
+    async def release(self, req: ReleaseRequest, request_id: str) -> ReleaseResponse:
+        async with self._lock:
+            lease = self._leases.pop(req.lease_id, None)
+            if lease is None:
+                log.info(json.dumps({
+                    "event": "release",
+                    "request_id": request_id,
+                    "lease_id": req.lease_id,
+                    "caller_id": req.caller_id,
+                    "result": "already_released",
+                }))
+                return ReleaseResponse(
+                    released=True,
+                    message="already released",
+                    request_id=request_id,
+                )
 
-    def stats(self) -> dict:
-        info = query_vram()
-        available = self._vram_available() if info else 0
-        return {
-            "mode": self.settings.coordinator_mode,
-            "vram_total_mb": info["total_mb"] if info else 0,
-            "vram_available_mb": available or 0,
-            "vram_committed_mb": self._committed_mb(),
-            "soft_floor_mb": self.settings.soft_floor_mb,
-            "hard_floor_mb": self.settings.hard_floor_mb,
-            "active_leases": len(self._leases),
-            "queue_depth": self._queue_depth,
-            "decisions": dict(self._decisions),
-        }
+            log.info(json.dumps({
+                "event": "release",
+                "request_id": request_id,
+                "lease_id": req.lease_id,
+                "caller_id": req.caller_id,
+                "vram_mb": lease.vram_mb,
+                "result": "ok",
+            }))
+            self._drain_queue_locked(time.monotonic())
+
+        return ReleaseResponse(released=True, message="ok", request_id=request_id)
+
+    async def stats(self) -> dict:
+        async with self._lock:
+            self._expire_leases_locked(time.monotonic())
+            total, used, available = self._gpu_snapshot()
+            return {
+                "mode": self.settings.coordinator_mode.value,
+                "vram_total_mb": total,
+                "vram_available_mb": available,
+                "vram_committed_mb": self._committed_mb_locked(),
+                "soft_floor_mb": self.settings.soft_floor_mb,
+                "hard_floor_mb": self.settings.hard_floor_mb,
+                "active_leases": len(self._leases),
+                "queue_depth": self._queue_depth_locked(),
+                "queue_depth_by_tier": self._queue_depth_by_tier_locked(),
+                "decisions": dict(self._decisions),
+            }
