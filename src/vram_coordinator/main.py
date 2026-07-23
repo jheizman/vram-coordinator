@@ -27,9 +27,9 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    coordinator.start()
+    await coordinator.start()
     yield
-    coordinator.stop()
+    await coordinator.stop()
 
 
 app = FastAPI(title="vram-coordinator", version="0.1.0", lifespan=lifespan)
@@ -85,8 +85,8 @@ def metrics():
     ]
     for result, count in s["decisions"].items():
         lines += [
-            f"# HELP vram_coordinator_decisions_total Admission decisions",
-            f"# TYPE vram_coordinator_decisions_total counter",
+            "# HELP vram_coordinator_decisions_total Admission decisions",
+            "# TYPE vram_coordinator_decisions_total counter",
             f'vram_coordinator_decisions_total{{result="{result}"}} {count}',
         ]
     return "\n".join(lines) + "\n"
