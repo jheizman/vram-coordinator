@@ -1,3 +1,5 @@
+import time
+from collections import deque
 from enum import Enum
 from typing import Optional
 
@@ -9,8 +11,51 @@ class CoordinatorMode(str, Enum):
     enforce = "enforce"
 
 
+class EnforceScope(str, Enum):
+    low = "low"
+    normal = "normal"
+    all = "all"
+
+
+TIER_SCOPE_THRESHOLD: dict[str, int] = {
+    "low": 3,    # enforce tier 3 (low) and above
+    "normal": 2, # enforce tier 2 (normal) and above
+    "all": 1,    # enforce all tiers
+}
+
+
+class TripwireState:
+    """Rolling-window deny-rate guardrail."""
+    def __init__(self, window_seconds: float = 60.0, max_deny_rate: float = 0.5, min_samples: int = 10):
+        self.window_seconds = window_seconds
+        self.max_deny_rate = max_deny_rate
+        self.min_samples = min_samples
+        self._events: deque = deque()
+
+    def record(self, denied: bool) -> None:
+        now = time.monotonic()
+        self._events.append((now, denied))
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def tripped(self) -> tuple[bool, float]:
+        now = time.monotonic()
+        self._prune(now)
+        total = len(self._events)
+        if total < self.min_samples:
+            return False, 0.0
+        deny_count = sum(1 for _, denied in self._events if denied)
+        rate = deny_count / total
+        return rate >= self.max_deny_rate, rate
+
+
 class Settings(BaseSettings):
     coordinator_mode: CoordinatorMode = CoordinatorMode.observe
+    enforce_scope: EnforceScope = EnforceScope.all
     listen_host: str = "0.0.0.0"
     listen_port: int = 8787
 
@@ -30,6 +75,13 @@ class Settings(BaseSettings):
     deadline_seconds_low: float = 45.0
 
     low_tier_shed_under_soft_pressure: bool = True
+
+    tripwire_enabled: bool = True
+    tripwire_window_seconds: float = 60.0
+    tripwire_max_deny_rate: float = 0.5
+    tripwire_min_samples: int = 10
+
+    admin_token: Optional[str] = None
 
     require_api_token: bool = False
     api_token: Optional[str] = None
@@ -61,6 +113,12 @@ class Settings(BaseSettings):
             return self.max_queue_depth_normal
         return self.max_queue_depth_low
 
+    def tier_is_enforced(self, tier: int) -> bool:
+        if self.coordinator_mode == CoordinatorMode.observe:
+            return False
+        threshold = TIER_SCOPE_THRESHOLD[self.enforce_scope.value]
+        return tier >= threshold
+
     def validate_policy(self) -> None:
         if self.hard_floor_mb < 0 or self.soft_floor_mb < 0 or self.safety_overhead_mb < 0:
             raise ValueError("floor and safety settings must be non-negative")
@@ -76,3 +134,5 @@ class Settings(BaseSettings):
             raise ValueError("per-tier deadlines must be > 0")
         if self.require_api_token and not self.api_token:
             raise ValueError("REQUIRE_API_TOKEN is true but API_TOKEN is empty")
+        if 0.0 >= self.tripwire_max_deny_rate or self.tripwire_max_deny_rate > 1.0:
+            raise ValueError("TRIPWIRE_MAX_DENY_RATE must be between 0 and 1 exclusive")

@@ -42,8 +42,25 @@ class DecisionCounters(BaseModel):
     shed: int
 
 
+class PolicyUpdateRequest(BaseModel):
+    mode: Optional[Literal["observe", "enforce"]] = None
+    enforce_scope: Optional[Literal["low", "normal", "all"]] = None
+    low_tier_shed_under_soft_pressure: Optional[bool] = None
+    reason: Optional[str] = None
+
+
+class PolicyResponse(BaseModel):
+    mode: str
+    enforce_scope: str
+    low_tier_shed_under_soft_pressure: bool
+    tripwire_enabled: bool
+    request_id: str
+    message: str
+
+
 class StatsResponse(BaseModel):
     mode: str
+    enforce_scope: str
     vram_total_mb: int
     vram_available_mb: int
     vram_committed_mb: int
@@ -56,6 +73,9 @@ class StatsResponse(BaseModel):
     decisions: DecisionCounters
     wait_ms_total: float
     wait_ms_count: int
+    tripwire_tripped: bool
+    tripwire_deny_rate: float
+    policy_changes: int
 
 
 class ErrorResponse(BaseModel):

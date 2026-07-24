@@ -6,9 +6,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from .config import CoordinatorMode, Settings
+from .config import CoordinatorMode, EnforceScope, Settings, TripwireState
 from .gpu import query_vram
-from .models import AcquireRequest, AcquireResponse, ReleaseRequest, ReleaseResponse
+from .models import AcquireRequest, AcquireResponse, PolicyUpdateRequest, ReleaseRequest, ReleaseResponse
 
 log = logging.getLogger(__name__)
 
@@ -43,15 +43,25 @@ class Coordinator:
         self._decision_reasons: Dict[str, int] = {}
         self._wait_ms_total = 0.0
         self._wait_ms_count = 0
+        self._policy_changes = 0
         self._ttl_task: Optional[asyncio.Task] = None
         self._queue_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         self._seq = 0
+        self._tripwire = TripwireState(
+            window_seconds=settings.tripwire_window_seconds,
+            max_deny_rate=settings.tripwire_max_deny_rate,
+            min_samples=settings.tripwire_min_samples,
+        )
 
     async def start(self):
         self._ttl_task = asyncio.create_task(self._ttl_loop())
         self._queue_task = asyncio.create_task(self._queue_loop())
-        log.info(json.dumps({"event": "startup", "mode": self.settings.coordinator_mode.value}))
+        log.info(json.dumps({
+            "event": "startup",
+            "mode": self.settings.coordinator_mode.value,
+            "enforce_scope": self.settings.enforce_scope.value,
+        }))
 
     async def stop(self):
         for task in (self._ttl_task, self._queue_task):
@@ -115,7 +125,7 @@ class Coordinator:
                 "reason": "deadline_exceeded",
             }))
 
-    def _queue_depth_by_tier_locked(self) -> dict[str, int]:
+    def _queue_depth_by_tier_locked(self) -> dict:
         counts = {"high": 0, "normal": 0, "low": 0}
         for pending in self._pending.values():
             if pending.tier == 1:
@@ -127,7 +137,7 @@ class Coordinator:
         return counts
 
     def _tier_queue_depth_locked(self, tier: int) -> int:
-        return sum(1 for pending in self._pending.values() if pending.tier == tier)
+        return sum(1 for p in self._pending.values() if p.tier == tier)
 
     def _queue_depth_locked(self) -> int:
         return len(self._pending)
@@ -135,7 +145,7 @@ class Coordinator:
     def _committed_mb_locked(self) -> int:
         return sum(lease.vram_mb for lease in self._leases.values())
 
-    def _gpu_snapshot(self) -> Optional[tuple[int, int, int]]:
+    def _gpu_snapshot(self) -> Optional[tuple]:
         info = query_vram()
         if info is None:
             return None
@@ -156,6 +166,22 @@ class Coordinator:
             return False, "soft_floor_low_tier"
         return True, "ok"
 
+    def _check_tripwire_locked(self) -> bool:
+        if not self.settings.tripwire_enabled:
+            return False
+        tripped, rate = self._tripwire.tripped()
+        if tripped and self.settings.coordinator_mode == CoordinatorMode.enforce:
+            log.error(json.dumps({
+                "event": "tripwire_tripped",
+                "deny_rate": round(rate, 4),
+                "threshold": self.settings.tripwire_max_deny_rate,
+                "action": "revert_to_observe",
+            }))
+            self.settings.coordinator_mode = CoordinatorMode.observe
+            self._policy_changes += 1
+            return True
+        return False
+
     def _grant_locked(self, pending: PendingAcquire, mode: str, available: int, now: float) -> None:
         lease_id = str(uuid.uuid4())
         self._leases[lease_id] = Lease(
@@ -169,10 +195,9 @@ class Coordinator:
         self._wait_ms_count += 1
         self._decisions["permit"] += 1
         self._mark_reason("permit")
-
+        self._tripwire.record(denied=False)
         if not pending.future.done():
             pending.future.set_result(("permit", lease_id, f"granted ({mode})"))
-
         log.info(json.dumps({
             "event": "acquire",
             "request_id": pending.request_id,
@@ -189,28 +214,28 @@ class Coordinator:
     def _drain_queue_locked(self, now: float) -> None:
         if not self._pending:
             return
-
         snapshot = self._gpu_snapshot()
         if snapshot is None:
             return
-
         _total, _used, available = snapshot
         ordered = sorted(self._pending.values(), key=lambda item: (item.tier, item.enqueue_seq))
-
         for pending in ordered:
             if pending.request_id not in self._pending:
+                continue
+            if not self.settings.tier_is_enforced(pending.tier):
+                self._pending.pop(pending.request_id, None)
+                self._grant_locked(pending, "observe", available, now)
                 continue
             can_grant, reason = self._can_grant_locked(pending.vram_mb, pending.tier, available)
             if can_grant:
                 self._pending.pop(pending.request_id, None)
                 self._grant_locked(pending, "enforce", available, now)
                 available -= pending.vram_mb
-                continue
-
-            if reason == "soft_floor_low_tier":
+            elif reason == "soft_floor_low_tier":
                 self._pending.pop(pending.request_id, None)
                 self._decisions["shed"] += 1
                 self._mark_reason(reason)
+                self._tripwire.record(denied=True)
                 if not pending.future.done():
                     pending.future.set_result(("shed", None, "soft pressure low-tier shedding"))
                 log.warning(json.dumps({
@@ -223,6 +248,42 @@ class Coordinator:
                     "reason": reason,
                 }))
 
+    async def update_policy(self, req: PolicyUpdateRequest, request_id: str) -> dict:
+        changes = {}
+        async with self._lock:
+            if req.mode is not None and req.mode != self.settings.coordinator_mode.value:
+                old = self.settings.coordinator_mode.value
+                self.settings.coordinator_mode = CoordinatorMode(req.mode)
+                changes["mode"] = {"from": old, "to": req.mode}
+                self._policy_changes += 1
+            if req.enforce_scope is not None and req.enforce_scope != self.settings.enforce_scope.value:
+                old = self.settings.enforce_scope.value
+                self.settings.enforce_scope = EnforceScope(req.enforce_scope)
+                changes["enforce_scope"] = {"from": old, "to": req.enforce_scope}
+                self._policy_changes += 1
+            if req.low_tier_shed_under_soft_pressure is not None and req.low_tier_shed_under_soft_pressure != self.settings.low_tier_shed_under_soft_pressure:
+                old = self.settings.low_tier_shed_under_soft_pressure
+                self.settings.low_tier_shed_under_soft_pressure = req.low_tier_shed_under_soft_pressure
+                changes["low_tier_shed_under_soft_pressure"] = {"from": old, "to": req.low_tier_shed_under_soft_pressure}
+                self._policy_changes += 1
+
+        if changes:
+            log.info(json.dumps({
+                "event": "policy_change",
+                "request_id": request_id,
+                "changes": changes,
+                "reason": req.reason or "not provided",
+            }))
+
+        return {
+            "mode": self.settings.coordinator_mode.value,
+            "enforce_scope": self.settings.enforce_scope.value,
+            "low_tier_shed_under_soft_pressure": self.settings.low_tier_shed_under_soft_pressure,
+            "tripwire_enabled": self.settings.tripwire_enabled,
+            "request_id": request_id,
+            "message": f"policy updated: {list(changes.keys())}" if changes else "no changes",
+        }
+
     async def acquire(self, req: AcquireRequest, request_id: str) -> AcquireResponse:
         now = time.monotonic()
         tier = int(req.tier)
@@ -230,8 +291,9 @@ class Coordinator:
 
         async with self._lock:
             self._expire_leases_locked(now)
+            self._check_tripwire_locked()
 
-            if self.settings.coordinator_mode == CoordinatorMode.observe:
+            if not self.settings.tier_is_enforced(tier):
                 snapshot = self._gpu_snapshot()
                 available = snapshot[2] if snapshot else 0
                 pending = PendingAcquire(
@@ -257,7 +319,6 @@ class Coordinator:
 
             snapshot = self._gpu_snapshot()
             if snapshot is None:
-                # fail-open by design
                 pending = PendingAcquire(
                     request_id=request_id,
                     caller_id=req.caller_id,
@@ -284,35 +345,21 @@ class Coordinator:
             if available <= 0:
                 self._decisions["deny"] += 1
                 self._mark_reason("no_headroom")
-                return AcquireResponse(
-                    lease_id=None,
-                    result="deny",
-                    vram_mb=0,
-                    message="no VRAM headroom available",
-                    request_id=request_id,
-                )
+                self._tripwire.record(denied=True)
+                return AcquireResponse(lease_id=None, result="deny", vram_mb=0,
+                                       message="no VRAM headroom available", request_id=request_id)
 
             if self._queue_depth_locked() >= self.settings.max_queue_depth:
                 self._decisions["shed"] += 1
                 self._mark_reason("queue_full_global")
-                return AcquireResponse(
-                    lease_id=None,
-                    result="shed",
-                    vram_mb=0,
-                    message="queue is full",
-                    request_id=request_id,
-                )
+                return AcquireResponse(lease_id=None, result="shed", vram_mb=0,
+                                       message="queue is full", request_id=request_id)
 
             if self._tier_queue_depth_locked(tier) >= self.settings.tier_queue_limit(tier):
                 self._decisions["shed"] += 1
                 self._mark_reason("queue_full_tier")
-                return AcquireResponse(
-                    lease_id=None,
-                    result="shed",
-                    vram_mb=0,
-                    message="tier queue is full",
-                    request_id=request_id,
-                )
+                return AcquireResponse(lease_id=None, result="shed", vram_mb=0,
+                                       message="tier queue is full", request_id=request_id)
 
             loop = asyncio.get_running_loop()
             pending = PendingAcquire(
@@ -338,77 +385,43 @@ class Coordinator:
                 if existed is not None:
                     self._decisions["shed"] += 1
                     self._mark_reason("deadline_exceeded")
-            return AcquireResponse(
-                lease_id=None,
-                result="shed",
-                vram_mb=0,
-                message="deadline exceeded",
-                request_id=request_id,
-            )
+            return AcquireResponse(lease_id=None, result="shed", vram_mb=0,
+                                   message="deadline exceeded", request_id=request_id)
 
         if result == "permit":
-            return AcquireResponse(
-                lease_id=lease_id,
-                result="permit",
-                vram_mb=req.vram_mb,
-                message=message,
-                request_id=request_id,
-            )
+            return AcquireResponse(lease_id=lease_id, result="permit", vram_mb=req.vram_mb,
+                                   message=message, request_id=request_id)
         if result == "deny":
-            return AcquireResponse(
-                lease_id=None,
-                result="deny",
-                vram_mb=0,
-                message=message,
-                request_id=request_id,
-            )
-        return AcquireResponse(
-            lease_id=None,
-            result="shed",
-            vram_mb=0,
-            message=message,
-            request_id=request_id,
-        )
+            return AcquireResponse(lease_id=None, result="deny", vram_mb=0,
+                                   message=message, request_id=request_id)
+        return AcquireResponse(lease_id=None, result="shed", vram_mb=0,
+                               message=message, request_id=request_id)
 
     async def release(self, req: ReleaseRequest, request_id: str) -> ReleaseResponse:
         async with self._lock:
             lease = self._leases.pop(req.lease_id, None)
             if lease is None:
                 self._mark_reason("release_already_released")
-                log.info(json.dumps({
-                    "event": "release",
-                    "request_id": request_id,
-                    "lease_id": req.lease_id,
-                    "caller_id": req.caller_id,
-                    "result": "already_released",
-                }))
+                log.info(json.dumps({"event": "release", "request_id": request_id,
+                                     "lease_id": req.lease_id, "caller_id": req.caller_id,
+                                     "result": "already_released"}))
                 return ReleaseResponse(released=True, message="already released", request_id=request_id)
-
-            log.info(json.dumps({
-                "event": "release",
-                "request_id": request_id,
-                "lease_id": req.lease_id,
-                "caller_id": req.caller_id,
-                "vram_mb": lease.vram_mb,
-                "result": "ok",
-            }))
+            log.info(json.dumps({"event": "release", "request_id": request_id,
+                                 "lease_id": req.lease_id, "caller_id": req.caller_id,
+                                 "vram_mb": lease.vram_mb, "result": "ok"}))
             self._drain_queue_locked(time.monotonic())
-
         return ReleaseResponse(released=True, message="ok", request_id=request_id)
 
     async def stats(self) -> dict:
         async with self._lock:
             self._expire_leases_locked(time.monotonic())
             snapshot = self._gpu_snapshot()
-            if snapshot is None:
-                total = 0
-                available = 0
-            else:
-                total = snapshot[0]
-                available = snapshot[2]
-
+            total = snapshot[0] if snapshot else 0
+            available = snapshot[2] if snapshot else 0
+            tripped, deny_rate = self._tripwire.tripped()
             return {
                 "mode": self.settings.coordinator_mode.value,
+                "enforce_scope": self.settings.enforce_scope.value,
                 "vram_total_mb": total,
                 "vram_available_mb": available,
                 "vram_committed_mb": self._committed_mb_locked(),
@@ -421,4 +434,7 @@ class Coordinator:
                 "decisions": dict(self._decisions),
                 "wait_ms_total": round(self._wait_ms_total, 2),
                 "wait_ms_count": self._wait_ms_count,
+                "tripwire_tripped": tripped,
+                "tripwire_deny_rate": round(deny_rate, 4),
+                "policy_changes": self._policy_changes,
             }

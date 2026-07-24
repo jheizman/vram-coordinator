@@ -10,11 +10,10 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from .config import Settings
 from .coordinator import Coordinator
 from .models import (
-    AcquireRequest,
-    AcquireResponse,
+    AcquireRequest, AcquireResponse,
     ErrorResponse,
-    ReleaseRequest,
-    ReleaseResponse,
+    PolicyUpdateRequest, PolicyResponse,
+    ReleaseRequest, ReleaseResponse,
     StatsResponse,
 )
 
@@ -36,7 +35,7 @@ async def lifespan(app: FastAPI):
     await coordinator.stop()
 
 
-app = FastAPI(title="vram-coordinator", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="vram-coordinator", version="0.4.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -63,6 +62,17 @@ def _validate_auth(request: Request) -> None:
             raise HTTPException(status_code=403, detail="invalid token")
 
 
+def _validate_admin(request: Request) -> None:
+    if settings.admin_token:
+        auth = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        if not auth.startswith(prefix):
+            raise HTTPException(status_code=401, detail="admin auth required")
+        token = auth[len(prefix):].strip()
+        if token != settings.admin_token:
+            raise HTTPException(status_code=403, detail="invalid admin token")
+
+
 def _validate_caller(caller_id: str) -> None:
     if settings.enforce_allowlist:
         allowed = settings.allowed_callers_set
@@ -74,17 +84,18 @@ def _validate_caller(caller_id: str) -> None:
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    request_id = _request_id(request)
-    code = f"http_{exc.status_code}"
-    body = ErrorResponse(code=code, message=str(exc.detail), request_id=request_id)
-    return JSONResponse(status_code=exc.status_code, content=body.model_dump())
+    rid = _request_id(request)
+    return JSONResponse(status_code=exc.status_code,
+                        content=ErrorResponse(code=f"http_{exc.status_code}",
+                                              message=str(exc.detail), request_id=rid).model_dump())
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    request_id = _request_id(request)
-    body = ErrorResponse(code="internal_error", message=str(exc), request_id=request_id)
-    return JSONResponse(status_code=500, content=body.model_dump())
+    rid = _request_id(request)
+    return JSONResponse(status_code=500,
+                        content=ErrorResponse(code="internal_error", message=str(exc),
+                                              request_id=rid).model_dump())
 
 
 @app.get("/health")
@@ -95,32 +106,26 @@ async def health(request: Request):
 @app.get("/ready")
 async def ready(request: Request):
     from .gpu import query_vram
-
     info = query_vram()
     return {
         "ready": True,
         "gpu_available": info is not None,
         "mode": settings.coordinator_mode.value,
+        "enforce_scope": settings.enforce_scope.value,
         "request_id": _request_id(request),
     }
 
 
-@app.post(
-    "/acquire",
-    response_model=AcquireResponse,
-    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
-)
+@app.post("/acquire", response_model=AcquireResponse,
+          responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
 async def acquire(req: AcquireRequest, request: Request):
     _validate_auth(request)
     _validate_caller(req.caller_id)
     return await coordinator.acquire(req, _request_id(request))
 
 
-@app.post(
-    "/release",
-    response_model=ReleaseResponse,
-    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
-)
+@app.post("/release", response_model=ReleaseResponse,
+          responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
 async def release(req: ReleaseRequest, request: Request):
     _validate_auth(request)
     _validate_caller(req.caller_id)
@@ -130,6 +135,19 @@ async def release(req: ReleaseRequest, request: Request):
 @app.get("/stats", response_model=StatsResponse)
 async def stats():
     return await coordinator.stats()
+
+
+@app.post("/admin/policy", response_model=PolicyResponse,
+          responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
+async def update_policy(req: PolicyUpdateRequest, request: Request):
+    _validate_admin(request)
+    return await coordinator.update_policy(req, _request_id(request))
+
+
+@app.get("/admin/policy", response_model=PolicyResponse)
+async def get_policy(request: Request):
+    _validate_admin(request)
+    return await coordinator.update_policy(PolicyUpdateRequest(), _request_id(request))
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -148,17 +166,23 @@ async def metrics():
         "# HELP vram_coordinator_queue_depth Current queue depth",
         "# TYPE vram_coordinator_queue_depth gauge",
         f"vram_coordinator_queue_depth {s['queue_depth']}",
-        "# HELP vram_coordinator_queue_depth_by_tier Current queue depth by tier",
+        "# HELP vram_coordinator_queue_depth_by_tier Queue depth by tier",
         "# TYPE vram_coordinator_queue_depth_by_tier gauge",
         f"vram_coordinator_queue_depth_by_tier{{tier=\"high\"}} {s['queue_depth_by_tier']['high']}",
         f"vram_coordinator_queue_depth_by_tier{{tier=\"normal\"}} {s['queue_depth_by_tier']['normal']}",
         f"vram_coordinator_queue_depth_by_tier{{tier=\"low\"}} {s['queue_depth_by_tier']['low']}",
-        "# HELP vram_coordinator_wait_ms_total Total wait time in ms for granted acquires",
+        "# HELP vram_coordinator_wait_ms_total Total wait ms for granted acquires",
         "# TYPE vram_coordinator_wait_ms_total counter",
         f"vram_coordinator_wait_ms_total {s['wait_ms_total']}",
-        "# HELP vram_coordinator_wait_ms_count Number of granted acquires included in wait total",
+        "# HELP vram_coordinator_wait_ms_count Granted acquires counted in wait total",
         "# TYPE vram_coordinator_wait_ms_count counter",
         f"vram_coordinator_wait_ms_count {s['wait_ms_count']}",
+        "# HELP vram_coordinator_tripwire_deny_rate Rolling deny rate",
+        "# TYPE vram_coordinator_tripwire_deny_rate gauge",
+        f"vram_coordinator_tripwire_deny_rate {s['tripwire_deny_rate']}",
+        "# HELP vram_coordinator_policy_changes_total Total runtime policy changes",
+        "# TYPE vram_coordinator_policy_changes_total counter",
+        f"vram_coordinator_policy_changes_total {s['policy_changes']}",
     ]
     for result, count in s["decisions"].items():
         lines += [
