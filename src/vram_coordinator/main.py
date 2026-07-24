@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     await coordinator.stop()
 
 
-app = FastAPI(title="vram-coordinator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="vram-coordinator", version="0.3.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -153,12 +153,24 @@ async def metrics():
         f"vram_coordinator_queue_depth_by_tier{{tier=\"high\"}} {s['queue_depth_by_tier']['high']}",
         f"vram_coordinator_queue_depth_by_tier{{tier=\"normal\"}} {s['queue_depth_by_tier']['normal']}",
         f"vram_coordinator_queue_depth_by_tier{{tier=\"low\"}} {s['queue_depth_by_tier']['low']}",
+        "# HELP vram_coordinator_wait_ms_total Total wait time in ms for granted acquires",
+        "# TYPE vram_coordinator_wait_ms_total counter",
+        f"vram_coordinator_wait_ms_total {s['wait_ms_total']}",
+        "# HELP vram_coordinator_wait_ms_count Number of granted acquires included in wait total",
+        "# TYPE vram_coordinator_wait_ms_count counter",
+        f"vram_coordinator_wait_ms_count {s['wait_ms_count']}",
     ]
     for result, count in s["decisions"].items():
         lines += [
             "# HELP vram_coordinator_decisions_total Admission decisions",
             "# TYPE vram_coordinator_decisions_total counter",
             f'vram_coordinator_decisions_total{{result="{result}"}} {count}',
+        ]
+    for reason, count in s["decision_reasons"].items():
+        lines += [
+            "# HELP vram_coordinator_decision_reasons_total Decision reasons",
+            "# TYPE vram_coordinator_decision_reasons_total counter",
+            f'vram_coordinator_decision_reasons_total{{reason="{reason}"}} {count}',
         ]
     return "\n".join(lines) + "\n"
 

@@ -67,11 +67,14 @@ else
   echo "  FAIL  active leases mismatch after release"
   FAIL=$((FAIL + 1))
 fi
+check "/stats decision_reasons present" '"decision_reasons"' "$S_AFTER"
 
 echo "--- metrics ---"
 M=$(curl -sf "$BASE/metrics")
 check "/metrics queue_depth_by_tier" 'vram_coordinator_queue_depth_by_tier' "$M"
 check "/metrics decisions_total" 'vram_coordinator_decisions_total' "$M"
+check "/metrics decision_reasons_total" 'vram_coordinator_decision_reasons_total' "$M"
+check "/metrics wait_ms_total" 'vram_coordinator_wait_ms_total' "$M"
 
 echo "=== results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

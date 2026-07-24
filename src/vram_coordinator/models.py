@@ -52,7 +52,10 @@ class StatsResponse(BaseModel):
     active_leases: int
     queue_depth: int
     queue_depth_by_tier: dict[str, int]
+    decision_reasons: dict[str, int]
     decisions: DecisionCounters
+    wait_ms_total: float
+    wait_ms_count: int
 
 
 class ErrorResponse(BaseModel):
