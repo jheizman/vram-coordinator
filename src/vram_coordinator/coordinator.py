@@ -435,7 +435,7 @@ class Coordinator:
                                  "result": "ok"}))
             return RenewResponse(renewed=True, lease_id=req.lease_id, message="ok", request_id=request_id)
 
-        async def stats(self) -> dict:
+    async def stats(self) -> dict:
         async with self._lock:
             self._expire_leases_locked(time.monotonic())
             snapshot = self._gpu_snapshot()

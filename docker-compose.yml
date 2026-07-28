@@ -1,5 +1,6 @@
 services:
   vram-coordinator:
+    build: .
     image: ghcr.io/jheizman/vram-coordinator:dev
     container_name: vram-coordinator
     env_file:
