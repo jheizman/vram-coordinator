@@ -7,6 +7,10 @@ if [ -z "${API_TOKEN:-}" ] && [ -f .env ]; then
   API_TOKEN=$(grep "^API_TOKEN=" .env | cut -d= -f2 | tr -d "[:space:]")
 fi
 API_TOKEN="${API_TOKEN:-}"
+if [ -z "${ADMIN_TOKEN:-}" ] && [ -f .env ]; then
+  ADMIN_TOKEN=$(grep "^ADMIN_TOKEN=" .env | cut -d= -f2 | tr -d "[:space:]")
+fi
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 PASS=0; FAIL=0
 
 check() {
@@ -43,10 +47,10 @@ check "/stats policy_changes" '"policy_changes"' "$S_AFTER"
 check "/stats enforce_scope" '"enforce_scope"' "$S_AFTER"
 
 echo "--- admin policy ---"
-P=$(curl -sf "$BASE/admin/policy")
+P=$(curl -sf "$BASE/admin/policy" -H "Authorization: Bearer $ADMIN_TOKEN")
 check "/admin/policy returns mode" '"mode"' "$P"
 check "/admin/policy returns enforce_scope" '"enforce_scope"' "$P"
-PU=$(curl -sf -X POST "$BASE/admin/policy" -H "Content-Type: application/json" -d '{"mode":"observe","reason":"smoke_test"}')
+PU=$(curl -sf -X POST "$BASE/admin/policy" -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"mode":"observe","reason":"smoke_test"}')
 check "/admin/policy update ok" '"message"' "$PU"
 
 echo "--- metrics ---"
@@ -62,7 +66,7 @@ check "/renew: acquire for test" '"result":"permit"' "$ACQ2"
 LEASE2=$(jq_field "$ACQ2" "['lease_id']")
 RNW=$(curl -sf -X POST "$BASE/renew" -H "Content-Type: application/json" -H "Authorization: Bearer $API_TOKEN" -d "{\"lease_id\":\"$LEASE2\",\"caller_id\":\"smoke_test\"}")
 check "/renew valid lease" '"renewed":true' "$RNW"; check "/renew returns lease_id" '"lease_id"' "$RNW"
-RNW_BAD=$(curl -sf -X POST "$BASE/renew" -H "Content-Type: application/json" -H "Authorization: Bearer $API_TOKEN" -d "{\"lease_id\":\"$LEASE2\",\"caller_id\":\"wrong_caller\"}")
+RNW_BAD=$(curl -sf -X POST "$BASE/renew" -H "Content-Type: application/json" -H "Authorization: Bearer $API_TOKEN" -d "{\"lease_id\":\"$LEASE2\",\"caller_id\":\"easyai\"}")
 check "/renew wrong caller_id" '"renewed":false' "$RNW_BAD"
 RNW_MISS=$(curl -sf -X POST "$BASE/renew" -H "Content-Type: application/json" -H "Authorization: Bearer $API_TOKEN" -d '{"lease_id":"00000000-0000-0000-0000-000000000000","caller_id":"smoke_test"}')
 check "/renew unknown lease_id" '"renewed":false' "$RNW_MISS"
