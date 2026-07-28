@@ -8,7 +8,7 @@ from typing import Dict, Optional
 
 from .config import CoordinatorMode, EnforceScope, Settings, TripwireState
 from .gpu import query_vram
-from .models import AcquireRequest, AcquireResponse, PolicyUpdateRequest, ReleaseRequest, ReleaseResponse
+from .models import AcquireRequest, AcquireResponse, PolicyUpdateRequest, ReleaseRequest, ReleaseResponse, RenewRequest, RenewResponse
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class Lease:
     vram_mb: int
     tier: int
     created_at: float = field(default_factory=time.monotonic)
+    last_renewed_at: Optional[float] = None
 
 
 @dataclass
@@ -412,7 +413,29 @@ class Coordinator:
             self._drain_queue_locked(time.monotonic())
         return ReleaseResponse(released=True, message="ok", request_id=request_id)
 
-    async def stats(self) -> dict:
+    async def renew(self, req: RenewRequest, request_id: str) -> RenewResponse:
+        async with self._lock:
+            lease = self._leases.get(req.lease_id)
+            if lease is None:
+                log.warning(json.dumps({"event": "renew", "request_id": request_id,
+                                        "lease_id": req.lease_id, "result": "not_found"}))
+                return RenewResponse(renewed=False, lease_id=req.lease_id,
+                                     message="lease not found or already expired", request_id=request_id)
+            if lease.caller_id != req.caller_id:
+                log.warning(json.dumps({"event": "renew", "request_id": request_id,
+                                        "lease_id": req.lease_id, "caller_id": req.caller_id,
+                                        "result": "caller_mismatch"}))
+                return RenewResponse(renewed=False, lease_id=req.lease_id,
+                                     message="caller_id does not match lease", request_id=request_id)
+            now = time.monotonic()
+            lease.created_at = now
+            lease.last_renewed_at = now
+            log.info(json.dumps({"event": "renew", "request_id": request_id,
+                                 "lease_id": req.lease_id, "caller_id": req.caller_id,
+                                 "result": "ok"}))
+            return RenewResponse(renewed=True, lease_id=req.lease_id, message="ok", request_id=request_id)
+
+        async def stats(self) -> dict:
         async with self._lock:
             self._expire_leases_locked(time.monotonic())
             snapshot = self._gpu_snapshot()

@@ -14,6 +14,7 @@ from .models import (
     ErrorResponse,
     PolicyUpdateRequest, PolicyResponse,
     ReleaseRequest, ReleaseResponse,
+    RenewRequest, RenewResponse,
     StatsResponse,
 )
 
@@ -35,7 +36,7 @@ async def lifespan(app: FastAPI):
     await coordinator.stop()
 
 
-app = FastAPI(title="vram-coordinator", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="vram-coordinator", version="0.5.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -130,6 +131,14 @@ async def release(req: ReleaseRequest, request: Request):
     _validate_auth(request)
     _validate_caller(req.caller_id)
     return await coordinator.release(req, _request_id(request))
+
+
+@app.post("/renew", response_model=RenewResponse,
+          responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
+async def renew(req: RenewRequest, request: Request):
+    _validate_auth(request)
+    _validate_caller(req.caller_id)
+    return await coordinator.renew(req, _request_id(request))
 
 
 @app.get("/stats", response_model=StatsResponse)

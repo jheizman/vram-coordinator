@@ -36,6 +36,18 @@ class ReleaseResponse(BaseModel):
     request_id: str
 
 
+class RenewRequest(BaseModel):
+    lease_id: str = Field(min_length=1)
+    caller_id: str = Field(min_length=1)
+
+
+class RenewResponse(BaseModel):
+    renewed: bool
+    lease_id: str
+    message: str
+    request_id: str
+
+
 class DecisionCounters(BaseModel):
     permit: int
     deny: int
