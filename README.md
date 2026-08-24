@@ -11,6 +11,7 @@ Host-level GPU VRAM admission/coordinator service.
 
 - `POST /acquire`
 - `POST /release`
+- `POST /renew`
 - `GET /health`
 - `GET /ready`
 - `GET /stats`
@@ -26,5 +27,7 @@ Host-level GPU VRAM admission/coordinator service.
 
 - API contract: `docs/api-contract.md`
 - Runbook: `docs/runbook.md`
+- Operations handoff: `docs/operations-handoff.md`
+- Changelog: `CHANGELOG.md`
 - Planning baseline: `docs/plan.md`
 - Round 4 validation notes: `docs/validation-round4.md`

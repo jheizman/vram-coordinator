@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     await coordinator.stop()
 
 
-app = FastAPI(title="vram-coordinator", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="vram-coordinator", version="0.6.0", lifespan=lifespan)
 
 
 @app.middleware("http")
